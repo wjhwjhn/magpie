@@ -2,11 +2,14 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/mcpauth"
@@ -280,5 +283,60 @@ func TestMCPProxyRefusedAfterRenewalRunsOut(t *testing.T) {
 	}
 	if st := mcpauth.StatusOf("neon", f.URL); !st.SignedIn || !st.Dead {
 		t.Fatalf("the sign-in after a renewed token was refused: %+v", st)
+	}
+}
+
+// A remote MCP server whose standalone GET SSE stream sends 200 OK headers
+// and then waits silently for server-initiated notifications must have its
+// response headers flushed to the agent immediately, without waiting for
+// the first body byte, both directly and through mcpKeyGuard's filter (#7744).
+func TestMCPProxyFlushesSilentGETStreamHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token func(t *testing.T) string
+	}{
+		{name: "direct", token: func(t *testing.T) string { return Token }},
+		{name: "restricted_key", token: func(t *testing.T) string { return keyHeldToMCP(t, "Some", "neon/run_sql") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fresh(t)
+			hold := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(hold) }) }
+			f := mcpauthtest.New(t)
+			f.HoldGet = hold
+			f.SignIn(t, "neon")
+
+			gw := httptest.NewServer(lanGuard(New().Handler()))
+			// Release hold before gw.Close so an early test failure cannot stall
+			// httptest.Server.Close waiting on the upstream GET handler.
+			defer gw.Close()
+			defer release()
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, gw.URL+"/mcp/neon", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Accept", "text/event-stream")
+			req.Header.Set("Mcp-Session-Id", "sess-1")
+			req.Header.Set("Authorization", "Bearer "+tc.token(t))
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("GET /mcp/neon blocked waiting for headers: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+				t.Fatalf("unexpected GET response: %d %v", resp.StatusCode, resp.Header)
+			}
+
+			release()
+			first, err := bufio.NewReader(resp.Body).ReadString('\n')
+			if err != nil || first != "id: 1\n" {
+				t.Fatalf("stream after header flush: %q %v", first, err)
+			}
+		})
 	}
 }

@@ -178,6 +178,13 @@ func (s *Server) mcpProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
+	// A standalone SSE GET (or streaming POST) may hold the connection open
+	// with no initial event bytes; flush headers right away on event streams
+	// so clients waiting on the status line don't block in resp.Body.Read
+	// (#7744). Non-SSE replies carry a body and don't need an early flush.
+	if flusher != nil && strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "text/event-stream") {
+		flusher.Flush()
+	}
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := resp.Body.Read(buf)

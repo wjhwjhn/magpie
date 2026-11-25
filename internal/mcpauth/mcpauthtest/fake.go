@@ -65,6 +65,10 @@ type Fake struct {
 	// registration response lets it: the token endpoint takes it as
 	// registered
 	Assign string
+	// HoldGet, when non-nil, holds a GET event stream open after flushing
+	// its 200 OK headers until the channel closes or the client disconnects,
+	// as a standalone SSE endpoint with no initial notifications does (#7744).
+	HoldGet <-chan struct{}
 
 	refuse  bool // RefuseTokens
 	codes   map[string]codeGrant
@@ -269,6 +273,7 @@ func (f *Fake) mcp(w http.ResponseWriter, r *http.Request) {
 	f.Calls = append(f.Calls, r.Method+" "+msg.Method+" "+r.Header.Get("Mcp-Session-Id"))
 	f.Seen = r.Header.Clone()
 	f.SeenQuery = r.URL.RawQuery
+	holdGet := f.HoldGet
 	f.mu.Unlock()
 	switch r.Method {
 	case http.MethodDelete:
@@ -276,6 +281,15 @@ func (f *Fake) mcp(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
+		if holdGet != nil {
+			w.WriteHeader(http.StatusOK)
+			fl.Flush()
+			select {
+			case <-holdGet:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		for i := 1; i <= 2; i++ {
 			fmt.Fprintf(w, "id: %d\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/ping\",\"params\":{\"n\":%d}}\n\n", i, i)
 			fl.Flush()
